@@ -1,62 +1,77 @@
 import os
+import time
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
+# --- ГЛАВНОЕ ИЗМЕНЕНИЕ: Импорт модуля CORS ---
+from fastapi.middleware.cors import CORSMiddleware 
 
-# Инициализация
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-ASSISTANT_ID = os.getenv("ASSISTANT_ID")
+# Получаем ключи из настроек Render
+api_key = os.getenv("OPENAI_API_KEY")
+assistant_id = os.getenv("ASSISTANT_ID")
+
+client = OpenAI(api_key=api_key)
 app = FastAPI()
 
-# Разрешаем Тильде стучаться к нам
+# --- ГЛАВНОЕ ИЗМЕНЕНИЕ: Разрешаем Тильде стучаться к нам ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],     # Разрешить всем сайтам (включая твою Тильду)
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],     # Разрешить любые методы (GET, POST и т.д.)
+    allow_headers=["*"],     # Разрешить любые заголовки
 )
+# ------------------------------------------------------------
 
-class UserRequest(BaseModel):
+class ChatRequest(BaseModel):
     message: str
     thread_id: str = None
 
-@app.post("/chat")
-async def chat_endpoint(request: UserRequest):
-    try:
-        # 1. Работаем с диалогом (Thread)
-        if not request.thread_id:
-            thread = client.beta.threads.create()
-            thread_id = thread.id
-        else:
-            thread_id = request.thread_id
-
-        # 2. Добавляем вопрос пользователя
-        client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=request.message
-        )
-
-        # 3. Запускаем Ассистента и ждем ответ
-        run = client.beta.threads.runs.create_and_poll(
-            thread_id=thread_id,
-            assistant_id=ASSISTANT_ID
-        )
-
-        if run.status == 'completed': 
-            messages = client.beta.threads.messages.list(thread_id=thread_id)
-            # OpenAI возвращает ответы в обратном порядке, берем первый (свежий)
-            bot_answer = messages.data[0].content[0].text.value
-            return {"response": bot_answer, "thread_id": thread_id}
-        else:
-            return {"response": "Ошибка обработки. Попробуйте позже.", "thread_id": thread_id}
-
-    except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/")
-def home():
-    return {"status": "Legal Bot is active"}
+def read_root():
+    return {"status": "ok", "message": "Thai Law Bot is running"}
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+    user_message = request.message
+    thread_id = request.thread_id
+
+    # 1. Если нет thread_id, создаем новый диалог
+    if not thread_id:
+        thread = client.beta.threads.create()
+        thread_id = thread.id
+    
+    # 2. Добавляем сообщение пользователя в диалог
+    client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=user_message
+    )
+
+    # 3. Запускаем Ассистента (чтобы он подумал)
+    run = client.beta.threads.runs.create(
+        thread_id=thread_id,
+        assistant_id=assistant_id
+    )
+
+    # 4. Ждем ответа (проверяем статус каждую секунду)
+    while run.status in ['queued', 'in_progress', 'cancelling']:
+        time.sleep(1)
+        run = client.beta.threads.runs.retrieve(
+            thread_id=thread_id,
+            run_id=run.id
+        )
+
+    # 5. Если всё ок — забираем последний ответ
+    if run.status == 'completed':
+        messages = client.beta.threads.messages.list(
+            thread_id=thread_id
+        )
+        # Ищем последнее сообщение от ассистента
+        for msg in messages.data:
+            if msg.role == "assistant":
+                bot_response = msg.content[0].text.value
+                return {"response": bot_response, "thread_id": thread_id}
+    
+    # Если что-то пошло не так
+    return {"response": "Извините, я задумался. Попробуйте спросить еще раз.", "thread_id": thread_id}
