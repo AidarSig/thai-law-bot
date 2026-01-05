@@ -1,25 +1,25 @@
 import os
 import time
 import logging
+import requests  # <--- Для отправки в Телеграм
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware 
 
-# Настройка логирования (чтобы видеть ошибки в логах Render)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Получаем ключи
 api_key = os.getenv("OPENAI_API_KEY")
 assistant_id = os.getenv("ASSISTANT_ID")
+# Новые переменные для Телеграма
+tg_token = os.getenv("TELEGRAM_TOKEN")
+tg_chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-# Инициализация OpenAI
 client = OpenAI(api_key=api_key)
 app = FastAPI()
 
-# Разрешения для браузера (CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,10 +28,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Модель данных (БРОНЕБОЙНАЯ: принимает null и прощает ошибки)
 class ChatRequest(BaseModel):
     message: str
     thread_id: Optional[str] = None 
+
+# --- ФУНКЦИЯ ОТПРАВКИ В ТЕЛЕГРАМ ---
+def send_to_telegram(text, thread_id):
+    if not tg_token or not tg_chat_id:
+        return # Если ключей нет, не отправляем
+    
+    try:
+        # Формируем сообщение: Текст клиента + Ссылка на диалог (для удобства)
+        msg = f"🔔 <b>НОВОЕ СООБЩЕНИЕ</b>\n\n👤 Клиент: {text}\n🆔 Диалог: {thread_id}"
+        
+        url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+        requests.post(url, json={
+            "chat_id": tg_chat_id,
+            "text": msg,
+            "parse_mode": "HTML"
+        })
+    except Exception as e:
+        logger.error(f"Telegram Error: {e}")
+# -----------------------------------
 
 @app.get("/")
 def read_root():
@@ -42,56 +60,46 @@ def chat(request: ChatRequest):
     try:
         user_message = request.message
         thread_id = request.thread_id
+        
+        if thread_id == "": thread_id = None
 
-        logger.info(f"Received message: {user_message}, thread_id: {thread_id}")
-
-        # 1. Если thread_id пустой или null, создаем новый
         if not thread_id:
-            logger.info("Creating new thread...")
             thread = client.beta.threads.create()
             thread_id = thread.id
+            # Уведомляем админа о новом клиенте
+            send_to_telegram("🚀 (Новый клиент начал диалог)", thread_id)
         
-        # 2. Добавляем сообщение
+        # ОТПРАВЛЯЕМ СООБЩЕНИЕ В ТЕЛЕГРАМ АДМИНУ
+        send_to_telegram(user_message, thread_id)
+
+        # Работа с OpenAI (как раньше)
         client.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
             content=user_message
         )
 
-        # 3. Запускаем бота
         run = client.beta.threads.runs.create(
             thread_id=thread_id,
             assistant_id=assistant_id
         )
 
-        # 4. Ждем ответ (с тайм-аутом, чтобы не висеть вечно)
-        start_time = time.time()
         while run.status in ['queued', 'in_progress', 'cancelling']:
-            # Если ждем дольше 50 секунд, прерываем (Render Free limit)
-            if time.time() - start_time > 50:
-                logger.error("Timeout reached")
-                return {"response": "Сервер долго думает. Попробуйте еще раз.", "thread_id": thread_id}
-            
             time.sleep(1)
             run = client.beta.threads.runs.retrieve(
                 thread_id=thread_id,
                 run_id=run.id
             )
 
-        # 5. Получаем ответ
         if run.status == 'completed':
             messages = client.beta.threads.messages.list(thread_id=thread_id)
-            # Ищем последнее сообщение бота
             for msg in messages.data:
                 if msg.role == "assistant":
                     if hasattr(msg.content[0], 'text'):
-                        bot_response = msg.content[0].text.value
-                        return {"response": bot_response, "thread_id": thread_id}
+                        return {"response": msg.content[0].text.value, "thread_id": thread_id}
         
-        logger.error(f"Run ended with status: {run.status}")
-        return {"response": "Не удалось получить ответ от ИИ.", "thread_id": thread_id}
+        return {"response": "Бот не ответил.", "thread_id": thread_id}
 
     except Exception as e:
-        logger.error(f"CRITICAL ERROR: {str(e)}")
-        # Возвращаем JSON даже при ошибке, чтобы фронтенд не падал
-        return {"response": "Произошла техническая ошибка. Повторите запрос.", "thread_id": request.thread_id}
+        logger.error(f"Error: {e}")
+        return {"response": "Ошибка сервера.", "thread_id": request.thread_id}
