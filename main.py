@@ -7,17 +7,24 @@ from pydantic import BaseModel
 from openai import AsyncOpenAI, RateLimitError, APIError
 
 # --- 1. НАСТРОЙКИ ---
-# Получаем ключи. Если их нет - код не упадет сразу, но выдаст ошибку в лог.
+# Берем ключи из переменных окружения Render
+# Исправлено согласно вашему скриншоту:
 api_key = os.environ.get("OPENAI_API_KEY")
-assistant_id = os.environ.get("OPENAI_ASSISTANT_ID") # Обратите внимание: имя переменной может отличаться в Render
+assistant_id = os.environ.get("ASSISTANT_ID") 
+
+# Проверка ключей при старте
+if not api_key:
+    print("CRITICAL ERROR: OPENAI_API_KEY not found in env!")
+if not assistant_id:
+    print("CRITICAL ERROR: ASSISTANT_ID not found in env!")
 
 client = AsyncOpenAI(api_key=api_key)
 app = FastAPI()
 
-# Тайм-аут ставим больше, чтобы не рубить connection раньше времени
-ATTEMPT_TIMEOUT = 50 
-MAX_RETRIES = 1 # Снижаем кол-во попыток для скорости
+# Увеличил таймаут ожидания ответа от ИИ до 60 секунд
+ATTEMPT_TIMEOUT = 60 
 
+# Настройка CORS (чтобы Тильда не блокировала запросы)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,23 +37,25 @@ class UserRequest(BaseModel):
     message: str
     thread_id: str = None
 
-# --- 2. ФУНКЦИИ ПОМОЩНИКИ ---
+# --- 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def clean_text(text):
+    """
+    Очищает текст от технических сносок OpenAI вида 【4:0†source】.
+    """
     if not text: return ""
-    # Удаляем аннотации типа 【4:0†source】
+    # Удаляем конструкции в скобках 【...】
     text = re.sub(r'【.*?】', '', text)
-    # Удаляем Markdown заголовки
+    # Удаляем лишние markdown символы, если нужно
     text = text.replace("###", "").replace("**", "")
-    # Чистим пробелы
+    # Убираем двойные пробелы
     text = re.sub(r' +', ' ', text)
     return text.strip()
 
-# --- ВРЕМЕННО ОТКЛЮЧИЛ ВАЛИДАТОР ДЛЯ СКОРОСТИ ---
-# На бесплатном тарифе Render двойной запрос к OpenAI вызывает Timeout
-# async def validate_answer_quality(answer_text): ...
-
 async def run_assistant_with_timeout(thread_id, assistant_id, timeout):
+    """
+    Запускает ассистента и ждет ответ не дольше timeout секунд.
+    """
     try:
         run = await client.beta.threads.runs.create(
             thread_id=thread_id,
@@ -57,74 +66,80 @@ async def run_assistant_with_timeout(thread_id, assistant_id, timeout):
         while True:
             elapsed = asyncio.get_event_loop().time() - start_time
             if elapsed > timeout:
-                print(f"⏳ Time is up! ({elapsed}s)")
-                # Пытаемся отменить, но не блокируем, если не вышло
+                print(f"⏳ Timeout reached ({elapsed}s). Cancelling run...")
                 try:
                     await client.beta.threads.runs.cancel(thread_id=thread_id, run_id=run.id)
                 except: pass
-                return False # Возвращаем False вместо ошибки, чтобы обработать мягко
+                return False 
 
             run_status = await client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
 
             if run_status.status == 'completed':
                 return True
             elif run_status.status in ['failed', 'cancelled', 'expired']:
-                print(f"❌ Run failed: {run_status.status}")
+                print(f"❌ Run failed with status: {run_status.status}")
                 return False
             
+            # Ждем 1 секунду перед следующей проверкой
             await asyncio.sleep(1)
     except Exception as e:
-        print(f"Run Error: {e}")
+        print(f"Run Execution Error: {e}")
         return False
 
 # --- 3. ГЛАВНЫЙ ЭНДПОИНТ ---
 
 @app.post("/chat")
 async def chat_endpoint(request: UserRequest):
-    print(f"\n📩 NEW: {request.message[:50]}... [Thread: {request.thread_id}]")
+    # Логирование входящего запроса (видно в Render Logs)
+    print(f"\n📩 INCOMING: {request.message[:50]}... [Thread: {request.thread_id}]")
 
     if not api_key or not assistant_id:
-        return {"response": "Ошибка сервера: не настроены ключи API.", "thread_id": request.thread_id}
+        return {"response": "Ошибка сервера: Отсутствуют API ключи.", "thread_id": request.thread_id}
 
     if not request.message.strip():
         return {"response": "...", "thread_id": request.thread_id}
 
     try:
-        # 1. Thread
+        # 1. Создание или восстановление треда
         if not request.thread_id:
             thread = await client.beta.threads.create()
             thread_id = thread.id
         else:
             thread_id = request.thread_id
 
-        # 2. Message
+        # 2. Отправка сообщения пользователя
         await client.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
             content=request.message
         )
 
-        # 3. Run
+        # 3. Запуск и ожидание (с таймаутом)
         success = await run_assistant_with_timeout(thread_id, assistant_id, ATTEMPT_TIMEOUT)
         
         if success:
             messages = await client.beta.threads.messages.list(thread_id=thread_id)
-            # Берем последнее сообщение
+            # OpenAI возвращает сообщения в обратном порядке (последнее - первое в списке)
             raw_answer = messages.data[0].content[0].text.value
+            
+            # 4. Очистка текста
             final_answer = clean_text(raw_answer)
-            print(f"🤖 BOT: {final_answer[:50]}...")
+            print(f"🤖 RESPONSE SENT: {final_answer[:50]}...")
+            
             return {"response": final_answer, "thread_id": thread_id}
         else:
-            # Если не успели или ошибка
+            # Если не успели за таймаут (сервер просыпался)
+            print("⚠️ Response too slow (Cold Start)")
             return {
-                "response": "Извините, сервер перегружен. Пожалуйста, повторите вопрос через 10 секунд.",
+                "response": "Сервер запускается из безопасного режима. Пожалуйста, отправьте сообщение еще раз — сейчас я отвечу мгновенно.",
                 "thread_id": thread_id
             }
 
     except Exception as e:
         print(f"💥 GLOBAL ERROR: {e}")
-        return {"response": "Техническая заминка. Повторите вопрос.", "thread_id": request.thread_id}
+        return {"response": "Техническая заминка. Пожалуйста, повторите вопрос.", "thread_id": request.thread_id}
 
+# Простой route для проверки жизни сервера
 @app.get("/")
 def home():
-    return {"status": "FastAPI ThaiBot Running"}
+    return {"status": "FastAPI ThaiBot is Running"}
