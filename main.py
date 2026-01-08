@@ -1,30 +1,24 @@
 import os
-import time
-import logging
-import requests
 import re
-from typing import Optional, Set
-from fastapi import FastAPI
+import asyncio
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
-from fastapi.middleware.cors import CORSMiddleware 
+from openai import AsyncOpenAI, RateLimitError, APIError
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
+# --- 1. НАСТРОЙКИ ---
 api_key = os.getenv("OPENAI_API_KEY")
 assistant_id = os.getenv("ASSISTANT_ID")
-tg_token = os.getenv("TELEGRAM_TOKEN")
-tg_chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-client = OpenAI(api_key=api_key)
+if not api_key or not assistant_id:
+    raise ValueError("CRITICAL: Проверь ключи в Environment Variables!")
+
+client = AsyncOpenAI(api_key=api_key)
 app = FastAPI()
 
-# --- ПАМЯТЬ БОТА (Кто уже оставил заявку) ---
-# Храним ID диалогов тех, кто уже "сдал" номер.
-# Чтобы их следующие сообщения тоже приходили юристу.
-active_leads: Set[str] = set() 
-# --------------------------------------------
+# Тайм-ауты и лимиты
+ATTEMPT_TIMEOUT = 30
+MAX_RETRIES = 2
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,123 +28,160 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class ChatRequest(BaseModel):
+class UserRequest(BaseModel):
     message: str
-    thread_id: Optional[str] = None 
+    thread_id: str = None
 
-# --- ФУНКЦИЯ 1: Скачивает всю историю (Для первой заявки) ---
-def get_thread_history(thread_id):
-    try:
-        messages = client.beta.threads.messages.list(thread_id=thread_id, limit=50)
-        history_text = ""
-        for msg in reversed(list(messages.data)):
-            role = "👤 Клиент" if msg.role == "user" else "🤖 Юрист"
-            if hasattr(msg.content[0], 'text'):
-                text = msg.content[0].text.value
-                text = re.sub(r'\*\*|__', '', text) 
-                history_text += f"<b>{role}:</b> {text}\n\n"
-        return history_text
-    except Exception as e:
-        return f"Ошибка истории: {e}"
+# --- 2. ФУНКЦИИ ПОМОЩНИКИ ---
 
-# --- ФУНКЦИЯ 2: Отправляет ГЛАВНУЮ заявку (Пакет) ---
-def send_lead_package(history_text, thread_id):
-    if not tg_token or not tg_chat_id: return 
+def clean_text(text):
+    """
+    Чистит текст от служебных аннотаций OpenAI (по ТЗ),
+    но сохраняет полезное форматирование (жирный текст, списки).
+    """
+    if not text: return ""
+    
+    # 1. Удаляем аннотации типа 【4:0†source】 (Требование ТЗ)
+    # Этот паттерн находит все, что находится внутри скобок 【 и 】
+    text = re.sub(r'【.*?】', '', text)
+    
+    # 2. Удаляем возможные двойные пробелы, которые могли появиться после удаления сносок
+    text = re.sub(r' +', ' ', text)
+    
+    return text.strip()
+
+async def validate_answer_quality(answer_text):
+    """ФУНКЦИЯ-КОНТРОЛЕР (ОТК)"""
     try:
-        msg = (
-            f"🔥 <b>НОВЫЙ ЛИД! (Контакт получен)</b>\n"
-            f"➖➖➖➖➖➖➖\n"
-            f"{history_text}"
-            f"➖➖➖➖➖➖➖\n"
-            f"🆔 <code>{thread_id}</code>"
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": (
+                    "Ты строгий контролер качества. Проверь текст."
+                    "Критерии ПРОВАЛА (отвечай 'BAD'):"
+                    "1. Текст НЕ на русском."
+                    "2. Текст содержит код, HTML или ошибки (Error 404)."
+                    "3. Текст грубый."
+                    "4. Текст бессвязный."
+                    "Иначе отвечай 'GOOD'."
+                )},
+                {"role": "user", "content": f"Текст:\n{answer_text}"}
+            ],
+            temperature=0,
+            max_tokens=5
         )
-        if len(msg) > 4000: msg = msg[:4000] + "... (обрезано)"
-        requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", json={
-            "chat_id": tg_chat_id, "text": msg, "parse_mode": "HTML"
-        })
+        verdict = response.choices[0].message.content.strip()
+        print(f"🔎 JUDGE VERDICT: {verdict}") # ЛОГ ВЕРДИКТА
+        
+        return "GOOD" in verdict
+            
     except Exception as e:
-        logger.error(f"Telegram Error: {e}")
+        print(f"Validator Error: {e}")
+        return True 
 
-# --- ФУНКЦИЯ 3: Отправляет "догоняющие" сообщения ---
-def send_follow_up(text, thread_id):
-    if not tg_token or not tg_chat_id: return 
-    try:
-        msg = f"💬 <b>Клиент пишет (дополнение):</b>\n{text}\n\n<code>{thread_id}</code>"
-        requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", json={
-            "chat_id": tg_chat_id, "text": msg, "parse_mode": "HTML"
-        })
-    except Exception as e:
-        logger.error(f"Telegram Error: {e}")
+async def run_assistant_with_timeout(thread_id, assistant_id, timeout):
+    run = await client.beta.threads.runs.create(
+        thread_id=thread_id,
+        assistant_id=assistant_id
+    )
+    start_time = asyncio.get_event_loop().time()
+    
+    while True:
+        if (asyncio.get_event_loop().time() - start_time) > timeout:
+            print(f"⏳ Time is up! Cancelling run {run.id}...")
+            try:
+                await client.beta.threads.runs.cancel(thread_id=thread_id, run_id=run.id)
+            except Exception: pass
+            raise asyncio.TimeoutError("Run took too long")
 
-@app.get("/")
-def read_root():
-    return {"status": "ok", "message": "Thai Law Bot is running"}
+        run_status = await client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+
+        if run_status.status == 'completed':
+            return True
+        elif run_status.status in ['failed', 'cancelled', 'expired']:
+            print(f"❌ Run failed status: {run_status.status}")
+            return False
+        
+        await asyncio.sleep(1)
+
+# --- 3. ГЛАВНЫЙ ЭНДПОИНТ ---
 
 @app.post("/chat")
-def chat(request: ChatRequest):
-    global active_leads
+async def chat_endpoint(request: UserRequest):
     try:
-        user_message = request.message
-        thread_id = request.thread_id
-        
-        if thread_id == "": thread_id = None
+        # ЛОГИРУЕМ ВОПРОС ПОЛЬЗОВАТЕЛЯ
+        print(f"\n📩 NEW MESSAGE [Thread: {request.thread_id}]")
+        print(f"👤 USER: {request.message}")
 
-        if not thread_id:
-            thread = client.beta.threads.create()
+        if not request.message.strip():
+            return {"response": "...", "thread_id": request.thread_id}
+
+        # А. Тред
+        if not request.thread_id:
+            thread = await client.beta.threads.create()
             thread_id = thread.id
-        
-        # 1. Сначала проверяем, не оставил ли клиент контакт ПРЯМО СЕЙЧАС
-        digit_count = sum(c.isdigit() for c in user_message)
-        is_contact_message = (digit_count >= 6) or ('@' in user_message) or ('телеграм' in user_message.lower())
-
-        # ЛОГИКА ОТПРАВКИ В ТЕЛЕГРАМ:
-        
-        # СЦЕНАРИЙ А: Это сообщение с контактом (Лид!)
-        if is_contact_message:
-            # Отправляем сообщение в OpenAI (чтобы оно сохранилось в историю)
-            client.beta.threads.messages.create(thread_id=thread_id, role="user", content=user_message)
-            
-            # Ждем секунду, чтобы ИИ "осознал"
-            # (Тут мы не ждем ответа ИИ, а сразу шлем заявку тебе)
-            
-            # Собираем историю И отправляем
-            full_history = get_thread_history(thread_id)
-            # Добавляем текущее сообщение, если get_thread_history его еще не видит (иногда бывает задержка)
-            if user_message not in full_history:
-                 full_history += f"<b>👤 Клиент:</b> {user_message}\n\n"
-            
-            send_lead_package(full_history, thread_id)
-            
-            # Запоминаем этого клиента как "Активного"
-            active_leads.add(thread_id)
-
-        # СЦЕНАРИЙ Б: Контакта нет, НО клиент уже в базе (пишет вдогонку)
-        elif thread_id in active_leads:
-             # Просто пересылаем это сообщение тебе
-             send_follow_up(user_message, thread_id)
-             client.beta.threads.messages.create(thread_id=thread_id, role="user", content=user_message)
-
-        # СЦЕНАРИЙ В: Просто болтовня без контактов
         else:
-             # Ничего тебе не шлем, просто общаемся с ботом
-             client.beta.threads.messages.create(thread_id=thread_id, role="user", content=user_message)
+            thread_id = request.thread_id
 
+        # Б. Сообщение
+        await client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=request.message
+        )
 
-        # --- ЗАПУСК БОТА (ОТВЕТ) ---
-        run = client.beta.threads.runs.create(thread_id=thread_id, assistant_id=assistant_id)
-        while run.status in ['queued', 'in_progress', 'cancelling']:
-            time.sleep(1)
-            run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+        # В. ЦИКЛ ПОПЫТОК
+        raw_answer = ""
+        success = False
 
-        if run.status == 'completed':
-            messages = client.beta.threads.messages.list(thread_id=thread_id)
-            for msg in messages.data:
-                if msg.role == "assistant":
-                    if hasattr(msg.content[0], 'text'):
-                        return {"response": msg.content[0].text.value, "thread_id": thread_id}
-        
-        return {"response": "...", "thread_id": thread_id}
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                print(f"🔄 Attempt #{attempt} started...")
+                is_finished = await run_assistant_with_timeout(thread_id, assistant_id, ATTEMPT_TIMEOUT)
+                
+                if is_finished:
+                    messages = await client.beta.threads.messages.list(thread_id=thread_id)
+                    raw_answer = messages.data[0].content[0].text.value
+                    
+                    if not raw_answer or len(raw_answer) < 5:
+                        continue
 
+                    # ОТК
+                    is_valid = await validate_answer_quality(raw_answer)
+                    
+                    if is_valid:
+                        success = True
+                        break 
+                    else:
+                        print(f"⛔ JUDGE REJECTED ANSWER: {raw_answer[:50]}...")
+                        continue 
+                
+                if attempt == MAX_RETRIES: break 
+
+            except asyncio.TimeoutError:
+                print(f"⏰ Timeout attempt #{attempt}")
+                continue
+
+        # Д. РЕЗУЛЬТАТ
+        if success:
+            final_answer = clean_text(raw_answer)
+            # ЛОГИРУЕМ ОТВЕТ БОТА
+            print(f"🤖 BOT: {final_answer}")
+            return {"response": final_answer, "thread_id": thread_id}
+        else:
+            print("💀 ALL ATTEMPTS FAILED")
+            return {
+                "response": "Извините, сейчас я не могу дать точный ответ на основании базы данных. Чтобы не вводить вас в заблуждение, прошу связаться с нашим менеджером напрямую.",
+                "thread_id": thread_id
+            }
+
+    except RateLimitError:
+        print("💸 RATE LIMIT HIT (Check Balance)")
+        return {"response": "Сервис перегружен, попробуйте через 5 минут.", "thread_id": request.thread_id}
     except Exception as e:
-        logger.error(f"Error: {e}")
-        return {"response": "Ошибка сервера.", "thread_id": request.thread_id}
+        print(f"💥 SERVER ERROR: {e}")
+        return {"response": "Техническая заминка. Повторите вопрос.", "thread_id": request.thread_id}
+
+@app.get("/")
+def home():
+    return {"status": "Legal Bot (Logs Enabled) is active"}
