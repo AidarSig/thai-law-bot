@@ -2,7 +2,7 @@ import os
 import re
 import asyncio
 import requests
-from typing import Optional, Set
+from typing import Optional, Set, Tuple
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,12 +17,16 @@ tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 client = AsyncOpenAI(api_key=api_key)
 app = FastAPI()
 
-# Тайм-аут 110 сек для стабильности
 ATTEMPT_TIMEOUT = 110 
 
-# БАЗА ДАННЫХ В ПАМЯТИ (Хранит ID тех, кто уже оставил контакт)
-# При перезагрузке сервера Render она очищается, но это не критично для новых лидов.
+# База данных отправленных тредов (чтобы не дублировать "Новый лид")
 leads_db: Set[str] = set()
+
+# Ключевые слова для определения интереса
+CONTACT_KEYWORDS = [
+    "контакт", "телефон", "номер", "позвонить", "связ", "адрес", "почта", "email",
+    "contact", "phone", "number", "call", "address", "whatsapp", "telegram"
+]
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +40,7 @@ class UserRequest(BaseModel):
     message: str
     thread_id: Optional[str] = None
 
-# --- 2. ФУНКЦИИ ТЕЛЕГРАМА И ИСТОРИИ ---
+# --- 2. ЛОГИКА АНАЛИЗА И ТЕЛЕГРАМА ---
 
 def clean_text(text):
     if not text: return ""
@@ -44,88 +48,102 @@ def clean_text(text):
     text = text.replace("###", "").replace("**", "")
     return text.strip()
 
-async def get_formatted_history(thread_id):
+async def get_history_data(thread_id) -> Tuple[str, int]:
     """
-    Скачивает историю диалога из OpenAI и форматирует её для Telegram.
+    Возвращает:
+    1. Отформатированный текст истории.
+    2. Количество сообщений ОТ ПОЛЬЗОВАТЕЛЯ (для фильтра).
     """
     try:
-        # Получаем список сообщений (OpenAI отдает их от новых к старым)
-        messages = await client.beta.threads.messages.list(thread_id=thread_id, limit=20)
-        
-        # Разворачиваем, чтобы было хронологически (от старых к новым)
+        messages = await client.beta.threads.messages.list(thread_id=thread_id, limit=30)
         history_list = list(reversed(messages.data))
         
         formatted_text = ""
+        user_msg_count = 0
+
         for msg in history_list:
             role = msg.role
             content = clean_text(msg.content[0].text.value)
             
             if role == "user":
+                user_msg_count += 1
                 formatted_text += f"👤 Клиент: {content}\n\n"
             elif role == "assistant":
                 formatted_text += f"🤖 Юрист: {content}\n\n"
                 
-        return formatted_text
+        return formatted_text, user_msg_count
     except Exception as e:
         print(f"History Error: {e}")
-        return "(Не удалось загрузить историю переписки)"
+        return "(Ошибка загрузки истории)", 0
 
 async def handle_telegram_notification(text, thread_id):
-    """
-    Умная логика отправки уведомлений
-    """
     if not tg_token or not tg_chat_id:
         return
 
-    # 1. Проверяем, есть ли контактные данные в текущем сообщении
-    # Ищем 7+ цифр подряд ИЛИ символ @ (для телеграм ников)
+    # А. ПРОВЕРКА НА ЯВНЫЙ КОНТАКТ (НОМЕР ТЕЛЕФОНА) -> ЭТО ЛИД
     clean_msg = re.sub(r'[\s\-]', '', text)
-    has_contact = re.search(r'\d{7,}', clean_msg) or ("@" in text and len(text) < 50)
+    has_phone = re.search(r'\d{7,}', clean_msg) or ("@" in text and len(text) < 50)
 
-    # 2. СЦЕНАРИЙ А: ПЕРВЫЙ КОНТАКТ (Новый лид)
-    if has_contact and thread_id not in leads_db:
-        leads_db.add(thread_id) # Запоминаем клиента
-        
-        # Формируем полную историю
-        full_history = await get_formatted_history(thread_id)
-        
-        msg_body = (
-            f"🔥 <b>НОВЫЙ ЛИД! (Контакт получен)</b>\n"
-            f"➖➖➖➖➖➖➖\n"
-            f"{full_history}"
-            f"➖➖➖➖➖➖➖\n"
-            f"🆔 <code>{thread_id}</code>"
-        )
-        await send_to_tg(msg_body)
+    if has_phone:
+        # Если это первый раз, когда он дал номер
+        if thread_id not in leads_db:
+            leads_db.add(thread_id)
+            history_text, _ = await get_history_data(thread_id)
+            
+            msg = (
+                f"🔥 <b>НОВЫЙ ЛИД! (Контакт получен)</b>\n"
+                f"➖➖➖➖➖➖➖\n"
+                f"{history_text}"
+                f"➖➖➖➖➖➖➖\n"
+                f"🆔 <code>{thread_id}</code>"
+            )
+            await send_to_tg(msg)
+        else:
+            # Если уже был лидом, но пишет еще что-то
+            msg = (
+                f"📝 <b>ДОП. ИНФО ОТ ЛИДА</b>\n"
+                f"➖➖➖➖➖➖➖\n"
+                f"👤 Клиент: {text}\n"
+                f"➖➖➖➖➖➖➖\n"
+                f"🔗 <code>{thread_id}</code>"
+            )
+            await send_to_tg(msg)
+        return # Выходим, так как приоритет отработан
 
-    # 3. СЦЕНАРИЙ Б: ДОПОЛНЕНИЕ (Клиент уже известен, пишет что-то еще)
-    elif thread_id in leads_db:
-        # Если клиент пишет дальше, мы отправляем это как дополнение, 
-        # чтобы вы не потеряли контекст.
-        msg_body = (
-            f"📝 <b>ДОП. СООБЩЕНИЕ ОТ ЛИДА</b>\n"
-            f"➖➖➖➖➖➖➖\n"
-            f"👤 Клиент: {text}\n"
-            f"➖➖➖➖➖➖➖\n"
-            f"🔗 К треду: <code>{thread_id}</code>"
-        )
-        await send_to_tg(msg_body)
+    # Б. ПРОВЕРКА НА ЗАПРОС КОНТАКТОВ (ИНТЕРЕС)
+    # Сработает только если клиент НЕ давал свой номер, но просит ваш
+    
+    # 1. Есть ли ключевое слово?
+    is_asking_contacts = any(word in text.lower() for word in CONTACT_KEYWORDS)
+    
+    if is_asking_contacts and thread_id not in leads_db:
+        # 2. Получаем историю и считаем сообщения
+        history_text, user_count = await get_history_data(thread_id)
+        
+        # 3. ФИЛЬТР: Только если диалог содержательный (более 2 сообщений от юзера)
+        if user_count > 2:
+            leads_db.add(thread_id) # Помечаем, чтобы не спамить каждым сообщением
+            
+            msg = (
+                f"👀 <b>ЗАПРОС КОНТАКТОВ (Интерес)</b>\n"
+                f"<i>Клиент активно интересуется связью, но свой номер пока не дал.</i>\n"
+                f"➖➖➖➖➖➖➖\n"
+                f"{history_text}"
+                f"➖➖➖➖➖➖➖\n"
+                f"🆔 <code>{thread_id}</code>"
+            )
+            await send_to_tg(msg)
 
 async def send_to_tg(text):
     url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-    payload = {
-        "chat_id": tg_chat_id,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-    # Отправляем в отдельном потоке, чтобы не тормозить ответ пользователю
+    payload = { "chat_id": tg_chat_id, "text": text, "parse_mode": "HTML" }
     try:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: requests.post(url, json=payload))
     except Exception as e:
-        print(f"TG Send Error: {e}")
+        print(f"TG Error: {e}")
 
-# --- 3. РАБОТА С ASSISTANT ---
+# --- 3. ASSISTANT LOGIC ---
 
 async def run_assistant_with_timeout(thread_id, assistant_id, timeout):
     try:
@@ -134,77 +152,66 @@ async def run_assistant_with_timeout(thread_id, assistant_id, timeout):
             assistant_id=assistant_id
         )
         start_time = asyncio.get_event_loop().time()
-        
         while True:
             elapsed = asyncio.get_event_loop().time() - start_time
             if elapsed > timeout:
-                try:
-                    await client.beta.threads.runs.cancel(thread_id=thread_id, run_id=run.id)
+                try: await client.beta.threads.runs.cancel(thread_id=thread_id, run_id=run.id)
                 except: pass
                 return False 
-
             run_status = await client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
-
-            if run_status.status == 'completed':
-                return True
-            elif run_status.status in ['failed', 'cancelled', 'expired']:
-                return False
-            
+            if run_status.status == 'completed': return True
+            elif run_status.status in ['failed', 'cancelled', 'expired']: return False
             await asyncio.sleep(1)
     except Exception as e:
         print(f"Run Error: {e}")
         return False
 
-# --- 4. MAIN ENDPOINT ---
+# --- 4. ENDPOINT ---
 
 @app.post("/chat")
 async def chat_endpoint(request: UserRequest):
-    print(f"\n📩 Message: {request.message[:50]}...")
-
+    # Фоновая проверка на триггеры Телеграма (ДО ответа ИИ, чтобы быстрее реагировать)
+    # Но для "Запроса контактов" нам нужна история, поэтому лучше запустим параллельно
+    
     if not api_key or not assistant_id:
-        return {"response": "Ошибка ключей.", "thread_id": request.thread_id}
+        return {"response": "Config Error", "thread_id": request.thread_id}
 
     if not request.message.strip():
         return {"response": "...", "thread_id": request.thread_id}
 
     try:
-        # А. Работа с тредом
         if not request.thread_id:
             thread = await client.beta.threads.create()
             thread_id = thread.id
         else:
             thread_id = request.thread_id
 
-        # Б. Отправка сообщения в OpenAI
         await client.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
             content=request.message
         )
 
-        # В. Генерация ответа (ждем до 110 сек)
+        # ЗАПУСК ТЕЛЕГРАМ-АНАЛИЗАТОРА
+        # Мы запускаем его "в фоне", но передаем thread_id
+        asyncio.create_task(handle_telegram_notification(request.message, thread_id))
+
         success = await run_assistant_with_timeout(thread_id, assistant_id, ATTEMPT_TIMEOUT)
         
-        # Г. Получение ответа
         final_answer = ""
         if success:
             messages = await client.beta.threads.messages.list(thread_id=thread_id)
             raw_answer = messages.data[0].content[0].text.value
             final_answer = clean_text(raw_answer)
         else:
-            # Если не успели, даем нейтральный ответ
-            final_answer = "Связь с базой данных устанавливается. Пожалуйста, подождите минуту - я анализирую ваш запрос."
-
-        # Д. ТЕЛЕГРАМ ЛОГИКА (Запускаем ПОСЛЕ того как получили ответ от ИИ)
-        # Мы делаем это в фоне, чтобы пользователь уже получил ответ на сайте
-        asyncio.create_task(handle_telegram_notification(request.message, thread_id))
+            final_answer = "Связь с базой данных устанавливается. Пожалуйста, подождите..."
 
         return {"response": final_answer, "thread_id": thread_id}
 
     except Exception as e:
-        print(f"Global Error: {e}")
+        print(f"Error: {e}")
         return {"response": "Секунду...", "thread_id": request.thread_id}
 
 @app.get("/")
 def home():
-    return {"status": "ThaiBot CRM v11 Active"}
+    return {"status": "ThaiBot v12 (Smart Leads)"}
