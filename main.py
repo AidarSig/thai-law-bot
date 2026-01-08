@@ -18,15 +18,7 @@ client = AsyncOpenAI(api_key=api_key)
 app = FastAPI()
 
 ATTEMPT_TIMEOUT = 110 
-
-# База данных отправленных тредов (чтобы не дублировать "Новый лид")
 leads_db: Set[str] = set()
-
-# Ключевые слова для определения интереса
-CONTACT_KEYWORDS = [
-    "контакт", "телефон", "номер", "позвонить", "связ", "адрес", "почта", "email",
-    "contact", "phone", "number", "call", "address", "whatsapp", "telegram"
-]
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,7 +32,37 @@ class UserRequest(BaseModel):
     message: str
     thread_id: Optional[str] = None
 
-# --- 2. ЛОГИКА АНАЛИЗА И ТЕЛЕГРАМА ---
+# --- 2. УПРОЩЕННЫЕ КАТЕГОРИИ ---
+
+CATEGORIES = {
+    "🔴 КРИМИНАЛ/SOS": [
+        "полици", "тюрьм", "арест", "задержа", "участок", "суд", "депорт", 
+        "нарко", "драка", "авари", "дтп", "police", "jail", "arrest", "sos", "prison"
+    ],
+    "🛂 БИЗНЕС/ВИЗЫ": [
+        "виза", "визу", "visa", "компани", "бизнес", "счет", "банк", "work permit", 
+        "ворк пермит", "открыть", "bank", "company", "лицензи", "license", "weed", "каннабис"
+    ],
+    "🏡 НЕДВИЖИМОСТЬ": [
+        "вилл", "квартир", "земл", "участ", "недвиж", "condo", "villa", "land", 
+        "buy", "rent", "аренд", "покуп", "chanote", "чанот"
+    ],
+    "💍 ГРАЖДАНСКОЕ": [
+        "развод", "жен", "муж", "ребен", "дите", "брак", "divorce", "marriage", 
+        "wife", "husband", "child", "долг", "займ", "наследств"
+    ],
+    "⚠️ НЕДОВЕРИЕ": [
+        "развод", "скам", "настоящий", "человек", "робот", "бот", "гаранти", 
+        "офис", "живой", "scam", "real", "human", "отзывы"
+    ]
+}
+
+CONTACT_KEYWORDS = [
+    "контакт", "телефон", "номер", "позвонить", "связ", "адрес", "почта", 
+    "contact", "phone", "number", "call", "address", "whatsapp", "telegram"
+]
+
+# --- 3. ЛОГИКА ---
 
 def clean_text(text):
     if not text: return ""
@@ -49,89 +71,96 @@ def clean_text(text):
     return text.strip()
 
 async def get_history_data(thread_id) -> Tuple[str, int]:
-    """
-    Возвращает:
-    1. Отформатированный текст истории.
-    2. Количество сообщений ОТ ПОЛЬЗОВАТЕЛЯ (для фильтра).
-    """
     try:
         messages = await client.beta.threads.messages.list(thread_id=thread_id, limit=30)
         history_list = list(reversed(messages.data))
-        
         formatted_text = ""
         user_msg_count = 0
-
         for msg in history_list:
             role = msg.role
             content = clean_text(msg.content[0].text.value)
-            
             if role == "user":
                 user_msg_count += 1
                 formatted_text += f"👤 Клиент: {content}\n\n"
             elif role == "assistant":
                 formatted_text += f"🤖 Юрист: {content}\n\n"
-                
         return formatted_text, user_msg_count
     except Exception as e:
         print(f"History Error: {e}")
-        return "(Ошибка загрузки истории)", 0
+        return "(Ошибка истории)", 0
+
+def detect_category(text) -> str:
+    """Возвращает только ОДНУ, самую приоритетную категорию"""
+    text_lower = text.lower()
+    
+    # Приоритет 1: Криминал (самое важное)
+    for kw in CATEGORIES["🔴 КРИМИНАЛ/SOS"]:
+        if kw in text_lower: return "🔴 КРИМИНАЛ/SOS"
+        
+    # Приоритет 2: Остальные
+    for cat, keywords in CATEGORIES.items():
+        for kw in keywords:
+            if kw in text_lower:
+                return cat
+    
+    return "" # Если категория не определена
 
 async def handle_telegram_notification(text, thread_id):
-    if not tg_token or not tg_chat_id:
-        return
+    if not tg_token or not tg_chat_id: return
 
-    # А. ПРОВЕРКА НА ЯВНЫЙ КОНТАКТ (НОМЕР ТЕЛЕФОНА) -> ЭТО ЛИД
     clean_msg = re.sub(r'[\s\-]', '', text)
-    has_phone = re.search(r'\d{7,}', clean_msg) or ("@" in text and len(text) < 50)
+    has_contact = re.search(r'\d{7,}', clean_msg) or ("@" in text and len(text) < 50)
+    category = detect_category(text)
 
-    if has_phone:
-        # Если это первый раз, когда он дал номер
+    # 1. ЕСТЬ КОНТАКТ -> ЭТО ЛИД
+    if has_contact:
+        header = f"🔥 <b>НОВЫЙ ЛИД!</b> {category}"
+        
         if thread_id not in leads_db:
             leads_db.add(thread_id)
             history_text, _ = await get_history_data(thread_id)
-            
-            msg = (
-                f"🔥 <b>НОВЫЙ ЛИД! (Контакт получен)</b>\n"
-                f"➖➖➖➖➖➖➖\n"
-                f"{history_text}"
-                f"➖➖➖➖➖➖➖\n"
-                f"🆔 <code>{thread_id}</code>"
-            )
+            msg = (f"{header}\n"
+                   f"➖➖➖➖➖➖➖\n"
+                   f"{history_text}"
+                   f"➖➖➖➖➖➖➖\n"
+                   f"🆔 <code>{thread_id}</code>")
             await send_to_tg(msg)
         else:
-            # Если уже был лидом, но пишет еще что-то
-            msg = (
-                f"📝 <b>ДОП. ИНФО ОТ ЛИДА</b>\n"
-                f"➖➖➖➖➖➖➖\n"
-                f"👤 Клиент: {text}\n"
-                f"➖➖➖➖➖➖➖\n"
-                f"🔗 <code>{thread_id}</code>"
-            )
+            msg = (f"📝 <b>ДОП. ИНФО</b> {category}\n"
+                   f"➖➖➖➖➖➖➖\n"
+                   f"👤 Клиент: {text}\n"
+                   f"➖➖➖➖➖➖➖\n"
+                   f"🔗 <code>{thread_id}</code>")
             await send_to_tg(msg)
-        return # Выходим, так как приоритет отработан
+        return
 
-    # Б. ПРОВЕРКА НА ЗАПРОС КОНТАКТОВ (ИНТЕРЕС)
-    # Сработает только если клиент НЕ давал свой номер, но просит ваш
-    
-    # 1. Есть ли ключевое слово?
+    # 2. НЕТ КОНТАКТА -> СМОТРИМ ПОВЕДЕНИЕ
+
+    # A. Криминал (SOS) шлем сразу
+    if "КРИМИНАЛ" in category and thread_id not in leads_db:
+        leads_db.add(thread_id)
+        history_text, _ = await get_history_data(thread_id)
+        msg = (f"{category}\n"
+               f"<i>ТРЕВОГА (Без контакта)!</i>\n"
+               f"➖➖➖➖➖➖➖\n"
+               f"{history_text}"
+               f"➖➖➖➖➖➖➖\n"
+               f"🆔 <code>{thread_id}</code>")
+        await send_to_tg(msg)
+        return
+
+    # B. Запрос контактов
     is_asking_contacts = any(word in text.lower() for word in CONTACT_KEYWORDS)
-    
     if is_asking_contacts and thread_id not in leads_db:
-        # 2. Получаем историю и считаем сообщения
         history_text, user_count = await get_history_data(thread_id)
-        
-        # 3. ФИЛЬТР: Только если диалог содержательный (более 2 сообщений от юзера)
         if user_count > 2:
-            leads_db.add(thread_id) # Помечаем, чтобы не спамить каждым сообщением
-            
-            msg = (
-                f"👀 <b>ЗАПРОС КОНТАКТОВ (Интерес)</b>\n"
-                f"<i>Клиент активно интересуется связью, но свой номер пока не дал.</i>\n"
-                f"➖➖➖➖➖➖➖\n"
-                f"{history_text}"
-                f"➖➖➖➖➖➖➖\n"
-                f"🆔 <code>{thread_id}</code>"
-            )
+            leads_db.add(thread_id)
+            msg = (f"👀 <b>ЗАПРОС КОНТАКТОВ</b> {category}\n"
+                   f"<i>Клиент просит связь</i>\n"
+                   f"➖➖➖➖➖➖➖\n"
+                   f"{history_text}"
+                   f"➖➖➖➖➖➖➖\n"
+                   f"🆔 <code>{thread_id}</code>")
             await send_to_tg(msg)
 
 async def send_to_tg(text):
@@ -143,14 +172,11 @@ async def send_to_tg(text):
     except Exception as e:
         print(f"TG Error: {e}")
 
-# --- 3. ASSISTANT LOGIC ---
+# --- 4. ASSISTANT ---
 
 async def run_assistant_with_timeout(thread_id, assistant_id, timeout):
     try:
-        run = await client.beta.threads.runs.create(
-            thread_id=thread_id,
-            assistant_id=assistant_id
-        )
+        run = await client.beta.threads.runs.create(thread_id=thread_id, assistant_id=assistant_id)
         start_time = asyncio.get_event_loop().time()
         while True:
             elapsed = asyncio.get_event_loop().time() - start_time
@@ -166,16 +192,12 @@ async def run_assistant_with_timeout(thread_id, assistant_id, timeout):
         print(f"Run Error: {e}")
         return False
 
-# --- 4. ENDPOINT ---
+# --- 5. ENDPOINT ---
 
 @app.post("/chat")
 async def chat_endpoint(request: UserRequest):
-    # Фоновая проверка на триггеры Телеграма (ДО ответа ИИ, чтобы быстрее реагировать)
-    # Но для "Запроса контактов" нам нужна история, поэтому лучше запустим параллельно
-    
     if not api_key or not assistant_id:
-        return {"response": "Config Error", "thread_id": request.thread_id}
-
+        return {"response": "Server Config Error", "thread_id": request.thread_id}
     if not request.message.strip():
         return {"response": "...", "thread_id": request.thread_id}
 
@@ -187,13 +209,9 @@ async def chat_endpoint(request: UserRequest):
             thread_id = request.thread_id
 
         await client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=request.message
+            thread_id=thread_id, role="user", content=request.message
         )
 
-        # ЗАПУСК ТЕЛЕГРАМ-АНАЛИЗАТОРА
-        # Мы запускаем его "в фоне", но передаем thread_id
         asyncio.create_task(handle_telegram_notification(request.message, thread_id))
 
         success = await run_assistant_with_timeout(thread_id, assistant_id, ATTEMPT_TIMEOUT)
@@ -204,7 +222,7 @@ async def chat_endpoint(request: UserRequest):
             raw_answer = messages.data[0].content[0].text.value
             final_answer = clean_text(raw_answer)
         else:
-            final_answer = "Связь с базой данных устанавливается. Пожалуйста, подождите..."
+            final_answer = "Связь установлена. Подбираю ответ..."
 
         return {"response": final_answer, "thread_id": thread_id}
 
@@ -214,4 +232,4 @@ async def chat_endpoint(request: UserRequest):
 
 @app.get("/")
 def home():
-    return {"status": "ThaiBot v12 (Smart Leads)"}
+    return {"status": "ThaiBot v15 (Clean Categories)"}
