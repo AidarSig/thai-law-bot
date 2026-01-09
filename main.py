@@ -25,7 +25,7 @@ client = AsyncOpenAI(api_key=api_key)
 app = FastAPI()
 
 # Таймер тишины (3 минуты)
-ANALYSIS_DELAY_SECONDS = 180 
+ANALYSIS_DELAY_SECONDS = 180
 ATTEMPT_TIMEOUT = 110
 
 # ХРАНИЛИЩА ДАННЫХ
@@ -320,4 +320,4 @@ async def get_history_page(thread_id: str):
 
 @app.get("/")
 def home():
-    return {"status": "ThaiLawBot v7.0 (Smart Delta Updates)"}
+    return {"status": "ThaiLawBot v7.6 (Clean & Stable)"}
