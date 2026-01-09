@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from openai import AsyncOpenAI
 
 # ==========================================
-# 1. НАСТРОЙКИ
+# 1. НАСТРОЙКИ И ПЕРЕМЕННЫЕ
 # ==========================================
 
 api_key = os.environ.get("OPENAI_API_KEY")
@@ -21,18 +21,15 @@ tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 client = AsyncOpenAI(api_key=api_key)
 app = FastAPI()
 
-# Таймер тишины перед отправкой (40 сек)
+# Таймер тишины: ждем 40 сек после последнего сообщения, прежде чем слать отчет в ТГ
 ANALYSIS_DELAY_SECONDS = 40 
+# Таймаут ожидания ответа от AI (110 сек)
 ATTEMPT_TIMEOUT = 110
 
-# СТАТУСЫ: None -> "INTERESTED" -> "CONFIRMED"
-leads_status: Dict[str, str] = {}
+# Хранилище времени последней активности для каждого диалога
 threads_last_activity: Dict[str, float] = {}
+# Хранилище активных задач мониторинга
 threads_monitoring_tasks: Dict[str, asyncio.Task] = {}
-
-# ТРИГГЕРЫ БОТА (Если бот сам выдал эти данные)
-FIRM_PHONE_FRAGMENT = "96-004-9705" 
-FIRM_EMAIL_FRAGMENT = "pravothai@lexprimethailand.com"
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,20 +44,22 @@ class UserRequest(BaseModel):
     thread_id: Optional[str] = None
 
 # ==========================================
-# 2. БЕЗОПАСНАЯ ИСТОРИЯ (FIX)
+# 2. ФУНКЦИИ ОЧИСТКИ И ИСТОРИИ
 # ==========================================
 
 def clean_text(text: str) -> str:
+    """Очищает текст от Markdown и экранирует символы для HTML Телеграма."""
     if not text: return ""
     text = re.sub(r'【.*?】', '', text)
     text = text.replace("###", "").replace("**", "")
-    # ВАЖНО: Экранируем скобки, чтобы не ломать HTML разметку Телеграма
+    # Экранируем теги, чтобы не ломать HTML разметку
     text = text.replace("<", "&lt;").replace(">", "&gt;") 
     return text.strip()
 
 async def get_safe_history(thread_id: str) -> Tuple[str, str, str]:
     """
-    Собирает историю аккуратно, чтобы не ломать HTML-теги при обрезке.
+    Собирает историю диалога для отправки в Telegram.
+    Возвращает: (отформатированный текст для ТГ, сырой текст юзера, сырой текст бота)
     """
     try:
         messages = await client.beta.threads.messages.list(thread_id=thread_id, limit=40)
@@ -84,13 +83,13 @@ async def get_safe_history(thread_id: str) -> Tuple[str, str, str]:
                 
                 temp_buffer.append(chunk)
 
-        # Собираем итоговый текст с конца (самые новые), следя за лимитом
+        # Собираем итоговый текст с конца (самые новые сообщения), следя за лимитом длины ТГ
         final_history_str = ""
         for chunk in reversed(temp_buffer):
             if len(final_history_str) + len(chunk) < 3800:
                 final_history_str = chunk + final_history_str
             else:
-                break # Лимит исчерпан
+                break 
                     
         return final_history_str, user_blob, bot_blob
     except Exception as e:
@@ -98,16 +97,18 @@ async def get_safe_history(thread_id: str) -> Tuple[str, str, str]:
         return "⚠️ История недоступна.", "", ""
 
 # ==========================================
-# 3. ЛОГИКА УВЕДОМЛЕНИЙ (FIX)
+# 3. ЛОГИКА УВЕДОМЛЕНИЙ В TELEGRAM
 # ==========================================
 
 async def send_tg_safe(text: str):
     """
     Отправляет сообщение безопасно. Если HTML сломан — шлет чистый текст.
     """
+    if not tg_token or not tg_chat_id: return
+
     url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
     
-    # Попытка 1: HTML
+    # Попытка 1: Отправка с форматированием HTML
     payload = {"chat_id": tg_chat_id, "text": text, "parse_mode": "HTML"}
     try:
         resp = requests.post(url, json=payload)
@@ -116,7 +117,7 @@ async def send_tg_safe(text: str):
     except Exception:
         pass
 
-    # Попытка 2: Текст без форматирования (страховка)
+    # Попытка 2: Текст без форматирования (если HTML вызвал ошибку)
     clean_msg = text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
     try:
         requests.post(url, json={"chat_id": tg_chat_id, "text": clean_msg})
@@ -124,82 +125,78 @@ async def send_tg_safe(text: str):
         print(f"TG Critical Error: {e}")
 
 async def check_and_send_notification(thread_id: str, formatted_history: str, user_text: str, bot_text: str):
-    if not tg_token or not tg_chat_id: return
-
+    """
+    Формирует уведомление и отправляет его.
+    """
+    # Заголовок по умолчанию
+    header = "💬 <b>НОВЫЙ ДИАЛОГ / АКТИВНОСТЬ</b>"
+    
+    # Простая проверка: если клиент сам оставил контакты в тексте
     clean_user_msg = re.sub(r'[\s\-]', '', user_text)
-    
-    # 1. ЕСТЬ ЛИ КОНТАКТ ОТ КЛИЕНТА?
-    has_user_phone = re.search(r'\d{7,}', clean_user_msg)
-    has_user_email = "@" in user_text and len(user_text) < 500
-    user_gave_contact = bool(has_user_phone or has_user_email)
+    # Ищем 7+ цифр подряд (телефон) или символ @ (почта/телега)
+    if re.search(r'\d{7,}', clean_user_msg) or ("@" in user_text and len(user_text) < 500):
+        header += " (Клиент оставил контакт 📞)"
 
-    # 2. ДАЛ ЛИ БОТ КОНТАКТЫ ФИРМЫ?
-    bot_gave_contact = (FIRM_PHONE_FRAGMENT in bot_text) or (FIRM_EMAIL_FRAGMENT in bot_text)
-
-    current_status = leads_status.get(thread_id)
-    header = ""
-
-    # Приоритет 1: Клиент
-    if user_gave_contact:
-        if current_status != "CONFIRMED":
-            header = "🔥 <b>НОВЫЙ ЛИД! (Контакт получен)</b>"
-            leads_status[thread_id] = "CONFIRMED" 
-        else:
-            header = "📝 <b>ДОП. ИНФО (От Лида)</b>"
-    
-    # Приоритет 2: Бот (Интерес)
-    elif bot_gave_contact:
-        if current_status is None:
-            header = "👀 <b>ВОЗМОЖНЫЙ ЛИД (Бот выдал контакты)</b>"
-            leads_status[thread_id] = "INTERESTED"
-
-    if header:
-        msg = (
-            f"{header}\n"
-            f"➖➖➖➖➖➖➖\n\n"
-            f"{formatted_history}"
-            f"➖➖➖➖➖➖➖\n"
-            f"🆔 <code>{thread_id}</code>"
-        )
-        await send_tg_safe(msg)
+    msg = (
+        f"{header}\n"
+        f"➖➖➖➖➖➖➖\n\n"
+        f"{formatted_history}"
+        f"➖➖➖➖➖➖➖\n"
+        f"🆔 <code>{thread_id}</code>"
+    )
+    await send_tg_safe(msg)
 
 # ==========================================
-# 4. ФОНОВЫЙ ПРОЦЕСС
+# 4. ФОНОВЫЙ ПРОЦЕСС МОНИТОРИНГА
 # ==========================================
 
 async def monitor_chat_activity(thread_id: str):
+    """
+    Следит за активностью в чате. Если тишина > 40 сек, отправляет историю в ТГ.
+    """
     try:
         while True:
             await asyncio.sleep(5)
             last_time = threads_last_activity.get(thread_id, 0)
             
-            # Тишина > 40 секунд
+            # Если прошло достаточно времени с последнего сообщения
             if time.time() - last_time > ANALYSIS_DELAY_SECONDS:
                 history_fmt, user_blob, bot_blob = await get_safe_history(thread_id)
-                if user_blob:
+                if user_blob: # Отправляем только если были сообщения от юзера
                     await check_and_send_notification(thread_id, history_fmt, user_blob, bot_blob)
                 break
                 
     except asyncio.CancelledError:
         pass
     finally:
+        # Удаляем задачу из памяти
         threads_monitoring_tasks.pop(thread_id, None)
 
 # ==========================================
-# 5. ГЛАВНЫЙ ЭНДПОИНТ (FIX)
+# 5. ГЛАВНАЯ ЛОГИКА АССИСТЕНТА (AI)
 # ==========================================
 
 async def run_assistant(thread_id, assistant_id):
     try:
-        # ОБНОВЛЕННАЯ ИНСТРУКЦИЯ (ANTI-HALLUCINATION)
+        # ОБНОВЛЕННАЯ СИСТЕМНАЯ ИНСТРУКЦИЯ
+        # 1. Четкая роль (Центр правовой помощи)
+        # 2. Запрет на LexPrime в названии
+        # 3. Приоритет выдачи контактов, а не их сбора
         instructions = (
-            "Твоя задача — консультировать ТОЛЬКО на основе прикрепленного файла pravothai.org. "
-            "КРИТИЧНО ВАЖНО: Игнорируй свои внутренние знания о сроках виз и законах, они могут быть устаревшими. "
-            "Доверяй ТОЛЬКО цифрам в файле. Если в файле написано 60 дней — отвечай 60, даже если ты помнишь 30. "
-            "Если ответа нет в файле — НЕ выдумывай, а пиши: 'Для точного ответа свяжитесь с нами' "
-            "и выдавай контакты: +66 96-004-9705, pravothai@lexprimethailand.com"
+            "Твоя роль: Ты — ИИ-ассистент «Центра правовой помощи соотечественникам в Таиланде». "
+            "СТРОГОЕ ПРАВИЛО: Никогда не называй себя LexPrime. Ты представляешь именно Центр правовой помощи. "
+            "Твоя цель: Консультировать строго на основе прикрепленного файла базы знаний. "
+            "ПРАВИЛО КОНТАКТОВ: Никогда не проси у клиента его номер телефона или email первым. "
+            "Вместо этого, если вопрос требует детального разбора или услуги, скажи: 'Для решения этого вопроса, пожалуйста, свяжитесь с нами' "
+            "и обязательно предоставь наши контакты: "
+            "📞 Телефон: +66 96-004-9705, "
+            "✈️ Telegram: @pravo_thai, "
+            "📧 Email: pravothai@lexprimethailand.com. "
+            "ГЕОГРАФИЯ: Только Таиланд. "
+            "Если ответа нет в файле — НЕ выдумывай, а сразу давай контакты."
         )
 
+        # Создаем и запускаем "Run"
         run = await client.beta.threads.runs.create(
             thread_id=thread_id,
             assistant_id=assistant_id,
@@ -217,40 +214,48 @@ async def run_assistant(thread_id, assistant_id):
                 return ""
             
             elif run_status.status in ['failed', 'expired', 'cancelled']:
-                return "Ошибка обработки запроса."
+                return "Извините, произошла ошибка обработки запроса. Пожалуйста, попробуйте еще раз или свяжитесь с нами по телефону +66 96-004-9705."
             
             await asyncio.sleep(1)
         
-        # FIX: Отмена при таймауте
+        # Если таймаут
         try: await client.beta.threads.runs.cancel(thread_id=thread_id, run_id=run.id)
         except: pass
-        return "Связь нестабильна."
+        return "Связь нестабильна. Пожалуйста, напишите нам в Telegram @pravo_thai."
 
     except Exception as e:
         print(f"Run Error: {e}")
-        return "Ошибка сервера."
+        return "Внутренняя ошибка сервера."
+
+# ==========================================
+# 6. API ENDPOINTS
+# ==========================================
 
 @app.post("/chat")
 async def chat_endpoint(request: UserRequest):
     if not api_key or not assistant_id:
-        return {"response": "Config Error", "thread_id": request.thread_id}
+        return {"response": "Config Error: API Key missing", "thread_id": request.thread_id}
 
-    # Инициализация ID
+    # Инициализация ID диалога
     thread_id = request.thread_id
     if not thread_id:
         thread = await client.beta.threads.create()
         thread_id = thread.id
 
+    # Обновляем время активности
     threads_last_activity[thread_id] = time.time()
 
+    # Запускаем фоновый мониторинг, если его нет
     if thread_id not in threads_monitoring_tasks:
         task = asyncio.create_task(monitor_chat_activity(thread_id))
         threads_monitoring_tasks[thread_id] = task
 
+    # Отправляем сообщение юзера в OpenAI
     await client.beta.threads.messages.create(
         thread_id=thread_id, role="user", content=request.message
     )
     
+    # Получаем ответ
     response_text = await run_assistant(thread_id, assistant_id)
     
     return {
@@ -260,4 +265,4 @@ async def chat_endpoint(request: UserRequest):
 
 @app.get("/")
 def home():
-    return {"status": "ThaiBot v29.0 (Anti-Hallucination & Safe HTML)"}
+    return {"status": "ThaiLawBot Active", "mode": "Center for Legal Aid"}
