@@ -216,7 +216,7 @@ async def run_assistant(thread_id, assistant_id):
             "и давай контакты. "
             "КОНТАКТЫ (Давай их всегда, если вопрос сложный): "
             "📞 Телефон: +66 96-004-9705, "
-            "✈️ Telegram: @pravo_thai. "
+            "📧 Email: pravothai@lexprimethailand.com "
             "ГЕОГРАФИЯ: Только Таиланд."
         )
 
@@ -239,7 +239,7 @@ async def run_assistant(thread_id, assistant_id):
         
         try: await client.beta.threads.runs.cancel(thread_id=thread_id, run_id=run.id)
         except: pass
-        return "Связь нестабильна. Напишите нам в Telegram @pravo_thai."
+        return "Связь нестабильна. Свяжитесь с нами по телефону +66 96-004-9705 или напишите нам на почту pravothai@lexprimethailand.com"
 
     except Exception as e:
         print(f"Run Error: {e}")
